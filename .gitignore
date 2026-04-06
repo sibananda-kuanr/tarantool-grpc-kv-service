@@ -34,3 +34,9 @@ apache-maven-*/
 
 # Docker volumes
 tarantool_data/
+
+# Temp files
+build.log
+metadata.xml
+maven.zip
+apache-maven-*/
