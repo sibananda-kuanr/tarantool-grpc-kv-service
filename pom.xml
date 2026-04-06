@@ -97,7 +97,10 @@
                 </executions>
             </plugin>
 
-            <!-- Fat JAR with all dependencies -->
+            <!-- Fat JAR with all dependencies.
+                 grpc-netty-shaded is already an internally-shaded artifact.
+                 We must NOT apply any class relocation to it — just include
+                 its classes verbatim. The filters below handle that. -->
             <plugin>
                 <groupId>org.apache.maven.plugins</groupId>
                 <artifactId>maven-shade-plugin</artifactId>
@@ -114,15 +117,20 @@
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
                                     <mainClass>com.example.kvservice.GrpcServer</mainClass>
                                 </transformer>
+                                <!-- Merge META-INF/services so gRPC service providers load correctly -->
                                 <transformer implementation="org.apache.maven.plugins.shade.resource.ServicesResourceTransformer"/>
+                                <!-- Merge NOTICE / LICENSE files to avoid overwrite warnings -->
+                                <transformer implementation="org.apache.maven.plugins.shade.resource.ApacheLicenseResourceTransformer"/>
                             </transformers>
                             <filters>
+                                <!-- Strip signature files that would invalidate the fat JAR -->
                                 <filter>
                                     <artifact>*:*</artifact>
                                     <excludes>
                                         <exclude>META-INF/*.SF</exclude>
                                         <exclude>META-INF/*.DSA</exclude>
                                         <exclude>META-INF/*.RSA</exclude>
+                                        <exclude>META-INF/DEPENDENCIES</exclude>
                                     </excludes>
                                 </filter>
                             </filters>
