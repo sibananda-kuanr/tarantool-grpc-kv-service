@@ -1,0 +1,36 @@
+# Git ignore for VK KV gRPC Service
+
+target/
+*.class
+*.jar
+*.war
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# Maven wrapper
+.mvn/
+mvnw
+mvnw.cmd
+
+# IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+.classpath
+.project
+.settings/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local Maven download
+maven.zip
+apache-maven-*/
+
+# Docker volumes
+tarantool_data/

@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  tarantool:
+    image: tarantool/tarantool:3.2
+    container_name: tarantool-kv
+    ports:
+      - "3301:3301"
+    volumes:
+      - ./tarantool/init.lua:/opt/tarantool/init.lua:ro
+      - tarantool_data:/var/lib/tarantool
+    command: tarantool /opt/tarantool/init.lua
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "tarantool", "-e", "require('socket').tcp_connect('localhost', 3301) and os.exit(0) or os.exit(1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  tarantool_data:

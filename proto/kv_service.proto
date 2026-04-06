@@ -1,0 +1,68 @@
+syntax = "proto3";
+
+package kvservice;
+
+option java_package = "com.example.kvservice.proto";
+option java_outer_classname = "KvServiceProto";
+option java_multiple_files = true;
+
+service KvService {
+  // Stores value for key (insert or overwrite)
+  rpc Put(PutRequest) returns (PutResponse);
+
+  // Returns value for the specified key
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Deletes value for the specified key
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // Returns stream of key-value pairs in the [key_since, key_to] range
+  rpc Range(RangeRequest) returns (stream RangeResponse);
+
+  // Returns the number of records in the database
+  rpc Count(CountRequest) returns (CountResponse);
+}
+
+message PutRequest {
+  string key = 1;
+  bytes value = 2; // nullable - empty bytes treated as null
+}
+
+message PutResponse {
+  bool success = 1;
+}
+
+message GetRequest {
+  string key = 1;
+}
+
+message GetResponse {
+  bool found = 1;
+  bytes value = 2; // empty if not found or null
+  bool value_is_null = 3; // true when key exists but value is null
+}
+
+message DeleteRequest {
+  string key = 1;
+}
+
+message DeleteResponse {
+  bool deleted = 1;
+}
+
+message RangeRequest {
+  string key_since = 1;
+  string key_to = 2;
+}
+
+message RangeResponse {
+  string key = 1;
+  bytes value = 2;
+  bool value_is_null = 3;
+}
+
+message CountRequest {}
+
+message CountResponse {
+  int64 count = 1;
+}
