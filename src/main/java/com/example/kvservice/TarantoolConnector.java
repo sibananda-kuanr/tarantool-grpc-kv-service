@@ -9,131 +9,141 @@ import java.util.Arrays;
 import java.util.List;
 
 /**
- * Thread-safe Tarantool client wrapper.
- * Uses org.tarantool:connector:1.6.9 (1.6.x series required by task spec).
+ * Wraps the Tarantool connection and exposes typed KV operations.
  *
- * <p>The legacy connector (1.6.x) uses integer-based space/index IDs.
- * We resolve the KV space ID and primary index ID at init time via eval.
+ * <p>The task requires using {@code org.tarantool:connector} version 1.6.x.
+ * That legacy connector communicates with Tarantool over the binary IPROTO
+ * protocol and identifies spaces/indexes by their numeric IDs — string names
+ * are not supported. We resolve both IDs once at startup via Lua eval and
+ * cache them for the lifetime of the connection.
+ *
+ * <p>Instances of this class are thread-safe: the underlying connector
+ * serialises requests internally.
  */
 public class TarantoolConnector implements AutoCloseable {
 
-    // Tarantool iterator constants (from iproto protocol)
-    // EQ=0, REQ=1, ALL=2, LT=3, LE=4, GE=5, GT=6, BITS_ALL_SET=7, BITS_ANY_SET=8, BITS_ALL_NOT_SET=9
-    private static final int ITER_EQ = 0;
-    private static final int ITER_GE = 5;
+    // IPROTO iterator type codes (from Tarantool docs)
+    private static final int ITER_EQ = 0;  // exact key match
+    private static final int ITER_GE = 5;  // first key >= search key (ordered scan)
 
-    private final TarantoolConnection16 conn;
+    // Number of tuples fetched per round-trip during a range scan.
+    // Keeps memory usage predictable regardless of result-set size.
+    private static final int BATCH_SIZE = 500;
+
+    private final TarantoolConnection16 connection;
     private final int spaceId;
     private final int indexId;
 
-    @SuppressWarnings("unchecked")
+    /**
+     * Opens a connection to Tarantool and resolves the numeric IDs for the
+     * {@code kv} space and its primary index.
+     *
+     * @throws IOException if the connection cannot be established or the
+     *                     {@code kv} space does not exist yet
+     */
     public TarantoolConnector(String host, int port) throws IOException {
-        this.conn = new TarantoolConnection16Impl(host, port);
-        System.out.println("Connected to Tarantool at " + host + ":" + port);
+        this.connection = new TarantoolConnection16Impl(host, port);
+        System.out.printf("[Tarantool] Connected to %s:%d%n", host, port);
 
-        // Resolve space ID for 'kv'
-        List<?> result = conn.eval(
-                "local s = box.space.kv; return s.id, s.index.primary.id"
+        // Resolve numeric space/index IDs required by the 1.6.x connector API.
+        List<?> ids = connection.eval(
+                "return box.space.kv.id, box.space.kv.index.primary.id"
         );
-        if (result == null || result.isEmpty()) {
-            throw new RuntimeException("Could not resolve kv space/index IDs");
+
+        if (ids == null || ids.size() < 2) {
+            throw new IOException(
+                    "Cannot resolve 'kv' space — is Tarantool fully initialised?"
+            );
         }
-        this.spaceId = ((Number) result.get(0)).intValue();
-        this.indexId = ((Number) result.get(1)).intValue();
-        System.out.println("KV space ID=" + spaceId + ", primary index ID=" + indexId);
+
+        this.spaceId = ((Number) ids.get(0)).intValue();
+        this.indexId = ((Number) ids.get(1)).intValue();
+        System.out.printf("[Tarantool] Space 'kv' id=%d, primary index id=%d%n",
+                spaceId, indexId);
     }
 
     /**
-     * put(key, value) — insert or overwrite (replace).
-     * value may be null (stored as varbinary null).
+     * Inserts or replaces the record {@code (key, value)}.
+     * Passing {@code null} as value stores a Tarantool {@code varbinary null}.
      */
     public void put(String key, byte[] value) {
-        // replace handles both insert and overwrite on the primary key
-        conn.replace(spaceId, Arrays.asList(key, value));
+        connection.replace(spaceId, Arrays.asList(key, value));
     }
 
     /**
-     * get(key) — returns the tuple [key, value] or null if not found.
+     * Returns the full {@code [key, value]} tuple for the given key,
+     * or {@code null} when the key does not exist.
+     *
+     * <p>The value element of the returned tuple (index 1) may itself be
+     * {@code null} when the key was stored with a null value.
      */
     @SuppressWarnings("unchecked")
     public List<Object> get(String key) {
-        List<?> result = conn.select(
-                spaceId,
-                indexId,
-                Arrays.asList(key),
-                0, 1, ITER_EQ
+        List<?> rows = connection.select(
+                spaceId, indexId, Arrays.asList(key), 0, 1, ITER_EQ
         );
-        if (result == null || result.isEmpty()) {
+        if (rows == null || rows.isEmpty()) {
             return null;
         }
-        Object first = result.get(0);
-        if (first instanceof List) {
-            return (List<Object>) first;
-        }
-        return null;
+        return (List<Object>) rows.get(0);
     }
 
     /**
-     * delete(key) — deletes the record. Returns true if something was deleted.
+     * Deletes the record for {@code key}.
+     *
+     * @return {@code true} if a record was deleted; {@code false} if the key
+     *         was not found
      */
-    @SuppressWarnings("unchecked")
     public boolean delete(String key) {
-        List<?> result = conn.delete(
-                spaceId,
-                Arrays.asList(key)
-        );
-        // Tarantool returns the deleted tuple; empty list means nothing was deleted
-        return result != null && !result.isEmpty();
+        List<?> deleted = connection.delete(spaceId, Arrays.asList(key));
+        return deleted != null && !deleted.isEmpty();
     }
 
     /**
-     * range(keySince, keyTo) — returns all tuples with key in [keySince, keyTo].
-     * TREE index GE iterator, stop when key > keyTo.
+     * Returns one page of tuples whose keys are {@code >= keySince}, ordered
+     * ascending. The caller is responsible for stopping when it encounters a
+     * key that exceeds the desired upper bound.
+     *
+     * <p>Using pages instead of a single unlimited select prevents loading
+     * millions of records into the JVM heap at once.
+     *
+     * @param keySince  the lower bound (inclusive) for the range scan
+     * @param offset    number of matching tuples to skip (for pagination)
+     * @param limit     maximum number of tuples to return
      */
     @SuppressWarnings("unchecked")
-    public List<List<Object>> range(String keySince, String keyTo) {
-        // GE on TREE index gives ordered results starting from keySince
-        List<?> result = conn.select(
-                spaceId,
-                indexId,
-                Arrays.asList(keySince),
-                0, Integer.MAX_VALUE, ITER_GE
+    public List<List<Object>> selectPage(String keySince, int offset, int limit) {
+        List<?> raw = connection.select(
+                spaceId, indexId, Arrays.asList(keySince), offset, limit, ITER_GE
         );
-
-        List<List<Object>> filtered = new ArrayList<>();
-        if (result == null) return filtered;
-
-        for (Object item : result) {
-            if (!(item instanceof List)) continue;
-            List<Object> tuple = (List<Object>) item;
-            if (tuple.isEmpty()) continue;
-            String tupleKey = (String) tuple.get(0);
-            if (tupleKey.compareTo(keyTo) > 0) break; // past range end
-            filtered.add(tuple);
+        if (raw == null) {
+            return new ArrayList<>();
         }
-        return filtered;
+        List<List<Object>> page = new ArrayList<>(raw.size());
+        for (Object item : raw) {
+            page.add((List<Object>) item);
+        }
+        return page;
     }
 
     /**
-     * count() — returns total record count in the KV space.
+     * Returns the total number of records stored in the KV space.
      */
-    @SuppressWarnings("unchecked")
     public long count() {
-        List<?> result = conn.eval("return box.space.kv:len()");
-        if (result == null || result.isEmpty()) return 0;
-        Object first = result.get(0);
-        if (first instanceof Number) {
-            return ((Number) first).longValue();
+        List<?> result = connection.eval("return box.space.kv:len()");
+        if (result == null || result.isEmpty()) {
+            return 0L;
         }
-        return 0;
+        return ((Number) result.get(0)).longValue();
+    }
+
+    /** Exposes the configured batch size so callers can page correctly. */
+    public int getBatchSize() {
+        return BATCH_SIZE;
     }
 
     @Override
     public void close() {
-        try {
-            conn.close();
-        } catch (Exception e) {
-            System.err.println("Error closing Tarantool connection: " + e.getMessage());
-        }
+        connection.close();
     }
 }

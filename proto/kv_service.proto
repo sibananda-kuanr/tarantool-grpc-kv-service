@@ -2,45 +2,59 @@ syntax = "proto3";
 
 package kvservice;
 
-option java_package = "com.example.kvservice.proto";
+option java_package         = "com.example.kvservice.proto";
 option java_outer_classname = "KvServiceProto";
-option java_multiple_files = true;
+option java_multiple_files  = true;
 
+// Key-value store service backed by Tarantool.
+// All five operations required by the task are defined here.
 service KvService {
-  // Stores value for key (insert or overwrite)
+
+  // Stores value for key. Overwrites any existing value.
+  // An empty bytes field is stored as a Tarantool varbinary null.
   rpc Put(PutRequest) returns (PutResponse);
 
-  // Returns value for the specified key
+  // Returns the value for the given key.
+  // found=false when the key does not exist.
+  // found=true + value_is_null=true when the key exists with a null value.
   rpc Get(GetRequest) returns (GetResponse);
 
-  // Deletes value for the specified key
+  // Removes the record for the given key.
+  // deleted=false when the key did not exist.
   rpc Delete(DeleteRequest) returns (DeleteResponse);
 
-  // Returns stream of key-value pairs in the [key_since, key_to] range
+  // Streams all key-value pairs whose keys fall in [key_since, key_to] inclusive.
+  // Results are ordered ascending by key.
   rpc Range(RangeRequest) returns (stream RangeResponse);
 
-  // Returns the number of records in the database
+  // Returns the total number of records in the database.
   rpc Count(CountRequest) returns (CountResponse);
 }
 
+// ---- Put ----
+
 message PutRequest {
-  string key = 1;
-  bytes value = 2; // nullable - empty bytes treated as null
+  string key   = 1;
+  bytes  value = 2; // empty bytes == null
 }
 
 message PutResponse {
   bool success = 1;
 }
 
+// ---- Get ----
+
 message GetRequest {
   string key = 1;
 }
 
 message GetResponse {
-  bool found = 1;
-  bytes value = 2; // empty if not found or null
-  bool value_is_null = 3; // true when key exists but value is null
+  bool   found        = 1;
+  bytes  value        = 2;
+  bool   value_is_null = 3; // true when key exists but the stored value is null
 }
+
+// ---- Delete ----
 
 message DeleteRequest {
   string key = 1;
@@ -50,16 +64,20 @@ message DeleteResponse {
   bool deleted = 1;
 }
 
+// ---- Range ----
+
 message RangeRequest {
-  string key_since = 1;
-  string key_to = 2;
+  string key_since = 1; // lower bound, inclusive
+  string key_to    = 2; // upper bound, inclusive
 }
 
 message RangeResponse {
-  string key = 1;
-  bytes value = 2;
-  bool value_is_null = 3;
+  string key          = 1;
+  bytes  value        = 2;
+  bool   value_is_null = 3;
 }
+
+// ---- Count ----
 
 message CountRequest {}
 

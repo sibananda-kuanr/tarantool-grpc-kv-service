@@ -11,11 +11,19 @@ services:
       - tarantool_data:/var/lib/tarantool
     command: tarantool /opt/tarantool/init.lua
     restart: unless-stopped
+    # The healthcheck polls until the IPROTO port is accepting connections.
+    # The Java service should be started only after this check passes.
     healthcheck:
-      test: ["CMD", "tarantool", "-e", "require('socket').tcp_connect('localhost', 3301) and os.exit(0) or os.exit(1)"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
+      test: >
+        tarantool -e "
+          local ok = require('socket').tcp_connect('127.0.0.1', 3301)
+          os.exit(ok and 0 or 1)
+        "
+      interval: 3s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
 
 volumes:
   tarantool_data:
+    driver: local

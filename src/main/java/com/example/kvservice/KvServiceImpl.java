@@ -1,14 +1,32 @@
 package com.example.kvservice;
 
-import com.example.kvservice.proto.*;
+import com.example.kvservice.proto.CountRequest;
+import com.example.kvservice.proto.CountResponse;
+import com.example.kvservice.proto.DeleteRequest;
+import com.example.kvservice.proto.DeleteResponse;
+import com.example.kvservice.proto.GetRequest;
+import com.example.kvservice.proto.GetResponse;
+import com.example.kvservice.proto.KvServiceGrpc;
+import com.example.kvservice.proto.PutRequest;
+import com.example.kvservice.proto.PutResponse;
+import com.example.kvservice.proto.RangeRequest;
+import com.example.kvservice.proto.RangeResponse;
 import com.google.protobuf.ByteString;
+import io.grpc.Status;
 import io.grpc.stub.StreamObserver;
 
 import java.util.List;
 
 /**
- * gRPC service implementation for the KV operations.
- * Delegates all data operations to TarantoolConnector.
+ * Implements every RPC defined in {@code kv_service.proto}.
+ *
+ * <p>Each method follows the same structure:
+ * <ol>
+ *   <li>Extract parameters from the protobuf request.</li>
+ *   <li>Call the corresponding {@link TarantoolConnector} method.</li>
+ *   <li>Map the result back into a protobuf response and complete the call.</li>
+ *   <li>On any error, propagate it as a gRPC {@code INTERNAL} status.</li>
+ * </ol>
  */
 public class KvServiceImpl extends KvServiceGrpc.KvServiceImplBase {
 
@@ -18,151 +36,199 @@ public class KvServiceImpl extends KvServiceGrpc.KvServiceImplBase {
         this.tarantool = tarantool;
     }
 
+    // -------------------------------------------------------------------------
+    // Put
+    // -------------------------------------------------------------------------
+
     /**
-     * put(key, value) — stores the value for new keys in the database and overwrites the value for existing ones.
-     * Handles null values (empty ByteString treated as null in storage).
+     * Stores a value under the given key, overwriting any existing record.
+     *
+     * <p>An empty {@code ByteString} in the request is interpreted as a null
+     * value and stored as a Tarantool {@code varbinary null}. This matches the
+     * requirement that put/get must work correctly with null values.
      */
     @Override
-    public void put(PutRequest request, StreamObserver<PutResponse> responseObserver) {
+    public void put(PutRequest request, StreamObserver<PutResponse> out) {
         try {
-            String key = request.getKey();
-            // Convert protobuf bytes to byte[] — treat empty ByteString as null (varbinary null)
-            ByteString valueBytes = request.getValue();
-            byte[] value = valueBytes.isEmpty() ? null : valueBytes.toByteArray();
+            // Proto3 defaults an absent bytes field to empty ByteString.
+            // We treat empty-equals-null so callers can store a null value.
+            byte[] value = request.getValue().isEmpty()
+                    ? null
+                    : request.getValue().toByteArray();
 
-            tarantool.put(key, value);
+            tarantool.put(request.getKey(), value);
 
-            responseObserver.onNext(PutResponse.newBuilder().setSuccess(true).build());
-            responseObserver.onCompleted();
+            out.onNext(PutResponse.newBuilder().setSuccess(true).build());
+            out.onCompleted();
         } catch (Exception e) {
-            responseObserver.onError(
-                    io.grpc.Status.INTERNAL
-                            .withDescription("put failed: " + e.getMessage())
-                            .withCause(e)
-                            .asRuntimeException()
-            );
+            out.onError(Status.INTERNAL
+                    .withDescription("put failed: " + e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Get
+    // -------------------------------------------------------------------------
+
     /**
-     * get(key) — returns the value for the specified key.
-     * Works correctly with null values in the value field.
+     * Retrieves the value stored under the given key.
+     *
+     * <p>The response distinguishes three cases:
+     * <ul>
+     *   <li>Key not found → {@code found=false}</li>
+     *   <li>Key found, value is null → {@code found=true, value_is_null=true}</li>
+     *   <li>Key found, value present → {@code found=true, value=<bytes>}</li>
+     * </ul>
      */
     @Override
-    public void get(GetRequest request, StreamObserver<GetResponse> responseObserver) {
+    public void get(GetRequest request, StreamObserver<GetResponse> out) {
         try {
-            String key = request.getKey();
-            List<Object> tuple = tarantool.get(key);
-
-            GetResponse.Builder builder = GetResponse.newBuilder();
+            List<Object> tuple = tarantool.get(request.getKey());
+            GetResponse.Builder response = GetResponse.newBuilder();
 
             if (tuple == null) {
-                // Key not found
-                builder.setFound(false);
+                response.setFound(false);
             } else {
-                builder.setFound(true);
-                Object rawValue = tuple.size() > 1 ? tuple.get(1) : null;
-                if (rawValue == null) {
-                    // Key exists but value is null
-                    builder.setValueIsNull(true);
-                    builder.setValue(ByteString.EMPTY);
-                } else if (rawValue instanceof byte[]) {
-                    builder.setValue(ByteString.copyFrom((byte[]) rawValue));
+                response.setFound(true);
+                Object raw = tuple.size() > 1 ? tuple.get(1) : null;
+
+                if (raw == null) {
+                    // Key exists but the stored value is a varbinary null.
+                    response.setValueIsNull(true).setValue(ByteString.EMPTY);
+                } else if (raw instanceof byte[]) {
+                    response.setValue(ByteString.copyFrom((byte[]) raw));
                 } else {
-                    // Fallback: convert to string bytes
-                    builder.setValue(ByteString.copyFromUtf8(rawValue.toString()));
+                    // Defensive fallback — should not normally occur with varbinary.
+                    response.setValue(ByteString.copyFromUtf8(raw.toString()));
                 }
             }
 
-            responseObserver.onNext(builder.build());
-            responseObserver.onCompleted();
+            out.onNext(response.build());
+            out.onCompleted();
         } catch (Exception e) {
-            responseObserver.onError(
-                    io.grpc.Status.INTERNAL
-                            .withDescription("get failed: " + e.getMessage())
-                            .withCause(e)
-                            .asRuntimeException()
-            );
+            out.onError(Status.INTERNAL
+                    .withDescription("get failed: " + e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
         }
     }
 
-    /**
-     * delete(key) — deletes the value for the specified key.
-     */
+    // -------------------------------------------------------------------------
+    // Delete
+    // -------------------------------------------------------------------------
+
+    /** Removes the record for the given key. */
     @Override
-    public void delete(DeleteRequest request, StreamObserver<DeleteResponse> responseObserver) {
+    public void delete(DeleteRequest request, StreamObserver<DeleteResponse> out) {
         try {
             boolean deleted = tarantool.delete(request.getKey());
-            responseObserver.onNext(DeleteResponse.newBuilder().setDeleted(deleted).build());
-            responseObserver.onCompleted();
+            out.onNext(DeleteResponse.newBuilder().setDeleted(deleted).build());
+            out.onCompleted();
         } catch (Exception e) {
-            responseObserver.onError(
-                    io.grpc.Status.INTERNAL
-                            .withDescription("delete failed: " + e.getMessage())
-                            .withCause(e)
-                            .asRuntimeException()
-            );
+            out.onError(Status.INTERNAL
+                    .withDescription("delete failed: " + e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Range (server-streaming)
+    // -------------------------------------------------------------------------
+
     /**
-     * range(key_since, key_to) — returns gRPC stream of key-value pairs from the requested range.
-     * Uses server-streaming to efficiently handle large result sets (5M records).
+     * Streams all records whose keys fall in the inclusive range
+     * [{@code key_since}, {@code key_to}].
+     *
+     * <p>Records are fetched from Tarantool in small pages so that memory
+     * consumption stays bounded even when the range spans millions of records.
+     * The TREE index guarantees ascending key order, which lets us stop as soon
+     * as we encounter a key beyond the requested upper bound.
      */
     @Override
-    public void range(RangeRequest request, StreamObserver<RangeResponse> responseObserver) {
+    public void range(RangeRequest request, StreamObserver<RangeResponse> out) {
         try {
             String keySince = request.getKeySince();
-            String keyTo = request.getKeyTo();
+            String keyTo    = request.getKeyTo();
+            int batchSize   = tarantool.getBatchSize();
+            int offset      = 0;
+            boolean done    = false;
 
-            List<List<Object>> results = tarantool.range(keySince, keyTo);
-
-            for (List<Object> tuple : results) {
-                if (tuple == null || tuple.isEmpty()) continue;
-
-                String key = (String) tuple.get(0);
-                Object rawValue = tuple.size() > 1 ? tuple.get(1) : null;
-
-                RangeResponse.Builder rb = RangeResponse.newBuilder().setKey(key);
-                if (rawValue == null) {
-                    rb.setValueIsNull(true);
-                    rb.setValue(ByteString.EMPTY);
-                } else if (rawValue instanceof byte[]) {
-                    rb.setValue(ByteString.copyFrom((byte[]) rawValue));
-                } else {
-                    rb.setValue(ByteString.copyFromUtf8(rawValue.toString()));
+            while (!done) {
+                List<List<Object>> page = tarantool.selectPage(keySince, offset, batchSize);
+                if (page.isEmpty()) {
+                    break; // no more data
                 }
 
-                responseObserver.onNext(rb.build());
+                for (List<Object> tuple : page) {
+                    String key = (String) tuple.get(0);
+
+                    if (key.compareTo(keyTo) > 0) {
+                        // We've gone past the requested upper bound.
+                        done = true;
+                        break;
+                    }
+
+                    out.onNext(buildRangeResponse(key, tuple));
+                }
+
+                // If the page was smaller than the batch size, it was the last one.
+                if (page.size() < batchSize) {
+                    break;
+                }
+                offset += batchSize;
             }
 
-            responseObserver.onCompleted();
+            out.onCompleted();
         } catch (Exception e) {
-            responseObserver.onError(
-                    io.grpc.Status.INTERNAL
-                            .withDescription("range failed: " + e.getMessage())
-                            .withCause(e)
-                            .asRuntimeException()
-            );
+            out.onError(Status.INTERNAL
+                    .withDescription("range failed: " + e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
         }
     }
 
-    /**
-     * count() — returns the number of records in the database.
-     */
+    // -------------------------------------------------------------------------
+    // Count
+    // -------------------------------------------------------------------------
+
+    /** Returns the total number of records currently stored in the KV space. */
     @Override
-    public void count(CountRequest request, StreamObserver<CountResponse> responseObserver) {
+    public void count(CountRequest request, StreamObserver<CountResponse> out) {
         try {
-            long count = tarantool.count();
-            responseObserver.onNext(CountResponse.newBuilder().setCount(count).build());
-            responseObserver.onCompleted();
+            long total = tarantool.count();
+            out.onNext(CountResponse.newBuilder().setCount(total).build());
+            out.onCompleted();
         } catch (Exception e) {
-            responseObserver.onError(
-                    io.grpc.Status.INTERNAL
-                            .withDescription("count failed: " + e.getMessage())
-                            .withCause(e)
-                            .asRuntimeException()
-            );
+            out.onError(Status.INTERNAL
+                    .withDescription("count failed: " + e.getMessage())
+                    .withCause(e)
+                    .asRuntimeException());
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
+
+    /**
+     * Converts a raw Tarantool tuple into a {@link RangeResponse} protobuf message.
+     * Handles the nullable value field the same way as {@link #get}.
+     */
+    private RangeResponse buildRangeResponse(String key, List<Object> tuple) {
+        RangeResponse.Builder item = RangeResponse.newBuilder().setKey(key);
+        Object raw = tuple.size() > 1 ? tuple.get(1) : null;
+
+        if (raw == null) {
+            item.setValueIsNull(true).setValue(ByteString.EMPTY);
+        } else if (raw instanceof byte[]) {
+            item.setValue(ByteString.copyFrom((byte[]) raw));
+        } else {
+            item.setValue(ByteString.copyFromUtf8(raw.toString()));
+        }
+
+        return item.build();
     }
 }
